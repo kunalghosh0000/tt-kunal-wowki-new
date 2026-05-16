@@ -20,7 +20,6 @@ project:
     - "project.v"
     - "fixedpoint_units.v"
     - "mac_array.v"
-    - "spi_slave.v"
     - "tt_um_kalman_accel.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
