@@ -68,12 +68,79 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/*
+ * tt_um_ml_coprocessor.v — Tiny ML Coprocessor (Project D)
+ *
+ * Tiny Tapeout top-level.
+ *
+ * Combines:
+ *  - 8-element signed Q8.8 MAC array (dot product accelerator)
+ *  - Q8.8 multiply unit (combinational)
+ *  - Q8.8 divide unit   (17 clock cycles)
+ *  - Q8.8 sqrt unit     (13 clock cycles)
+ *  - Kalman gain shortcut (A / (A+C), single command)
+ *
+ * ── Fixed-Point Format ────────────────────────────────────────────────────
+ * Q8.8 signed (16-bit two's complement) throughout.
+ * To encode a float f: write (int16_t)(f * 256.0)
+ * To decode:           read  (float)raw / 256.0
+ *
+ * ── SPI Protocol ──────────────────────────────────────────────────────────
+ * Mode 0 (CPOL=0, CPHA=0), MSB first, 8-bit framing.
+ *
+ *  ┌──────────────┬──────┬────────────────────────────────────────────────┐
+ *  │ Command      │ Hex  │ Description                                    │
+ *  ├──────────────┼──────┼────────────────────────────────────────────────┤
+ *  │ LOAD_A       │ 0x10 │ Load operand A (2 bytes follow: MSB, LSB)      │
+ *  │ LOAD_B       │ 0x11 │ Load operand B (2 bytes follow)                │
+ *  │ LOAD_C       │ 0x12 │ Load operand C (2 bytes follow)                │
+ *  │ LOAD_WEIGHT  │ 0x13 │ Load weight[idx]: 1 byte idx, 2 bytes data     │
+ *  │ LOAD_INPUT   │ 0x14 │ Stream 8 input bytes → starts MAC when done    │
+ *  ├──────────────┼──────┼────────────────────────────────────────────────┤
+ *  │ OP_MUL       │ 0x20 │ result = A * B          (combinational)        │
+ *  │ OP_DIV       │ 0x21 │ result = A / B          (17 clk)               │
+ *  │ OP_MACDIV    │ 0x22 │ result = A / (A + C)    (Kalman K, 17 clk)     │
+ *  │ OP_SQRT      │ 0x23 │ result = sqrt(A)        (13 clk, unsigned A)   │
+ *  │ OP_DOT       │ 0x24 │ result = dot(weights, inputs)  (uses MAC unit) │
+ *  ├──────────────┼──────┼────────────────────────────────────────────────┤
+ *  │ READ_RESULT  │ 0x30 │ Read 2 bytes result (MSB then LSB)             │
+ *  │ READ_STATUS  │ 0x31 │ Read 1 byte: [ovf|dbz|busy|done|mac_done|0x0]  │
+ *  └──────────────┴──────┴────────────────────────────────────────────────┘
+ *
+ *  LOAD_WEIGHT byte sequence:  0x13  IDX(0-7)  DATA_HI  DATA_LO
+ *  LOAD_INPUT  byte sequence:  0x14  IN0 IN1 IN2 IN3 IN4 IN5 IN6 IN7
+ *    (8 unsigned Q0.8 input bytes; MAC starts automatically after IN7)
+ *
+ *  READ_RESULT:  First 0x30 returns HI byte on MISO for the NEXT SPI byte,
+ *                then a dummy 0x00 returns the LO byte.
+ *                i.e. the RP2040 does:  spi_transfer(0x30) → ignore
+ *                                       spi_transfer(0x00) → hi
+ *                                       spi_transfer(0x00) → lo
+ *
+ * ── Pin Mapping ───────────────────────────────────────────────────────────
+ * uio[0]  SCK   in    SPI clock
+ * uio[1]  MOSI  in    SPI data in
+ * uio[2]  CS#   in    SPI chip select (active low)
+ * uio[3]  MISO  out   SPI data out
+ * uio[4]  BUSY  out   any operation in progress
+ * uio[5]  DONE  out   result ready (1 clk pulse)
+ * uio[6]  OVF   out   overflow (sticky, cleared on new op)
+ * uio[7]  DBZ   out   divide by zero
+ *
+ * uo_out[7:0]  result[15:8] — high byte of result (for fast polling)
+ *
+ * Copyright (c) 2025 Your Name
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 `default_nettype none
 
 module tt_um_ml_coprocessor (
-    input  wire [7:0] ui_in,
-    output wire [7:0] uo_out,
-    inout  wire [7:0] uio,
+    input  wire [7:0] ui_in,    // dedicated inputs (unused)
+    output wire [7:0] uo_out,   // result high byte for fast polling
+    input  wire [7:0] uio_in,   // uio inputs:  [0]=SCK [1]=MOSI [2]=CS#
+    output wire [7:0] uio_out,  // uio outputs: [3]=MISO [4]=BUSY [5]=DONE [6]=OVF [7]=DBZ
+    output wire [7:0] uio_oe,   // uio direction: 1=output, 0=input
     input  wire       ena,
     input  wire       clk,
     input  wire       rst_n
@@ -81,19 +148,24 @@ module tt_um_ml_coprocessor (
 
     // ================================================================
     // Pin wiring
+    // uio[2:0] are inputs (SCK, MOSI, CS#)
+    // uio[7:3] are outputs (MISO, BUSY, DONE, OVF, DBZ)
     // ================================================================
-    wire spi_sck  = uio[0];
-    wire spi_mosi = uio[1];
-    wire spi_cs_n = uio[2];
+    assign uio_oe = 8'b1111_1000;   // [7:3]=output, [2:0]=input
+
+    wire spi_sck  = uio_in[0];
+    wire spi_mosi = uio_in[1];
+    wire spi_cs_n = uio_in[2];
     wire spi_miso_w;
 
     wire busy_out, done_out, ovf_out, dbz_out;
 
-    assign uio[3] = spi_miso_w;
-    assign uio[4] = busy_out;
-    assign uio[5] = done_out;
-    assign uio[6] = ovf_out;
-    assign uio[7] = dbz_out;
+    assign uio_out[2:0] = 3'b000;      // input-direction bits: drive 0
+    assign uio_out[3]   = spi_miso_w;
+    assign uio_out[4]   = busy_out;
+    assign uio_out[5]   = done_out;
+    assign uio_out[6]   = ovf_out;
+    assign uio_out[7]   = dbz_out;
 
     // ================================================================
     // SPI Slave
