@@ -5,7 +5,7 @@ project:
   discord:      "KG"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "Machine learning co-processor"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     0       # Clock frequency in Hz (or 0 if not applicable)
+  clock_hz:     50000000       # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
   tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
@@ -33,24 +33,24 @@ pinout:
   ui[7]: ""
 
   # Outputs
-  uo[0]: ""
-  uo[1]: ""
-  uo[2]: ""
-  uo[3]: ""
-  uo[4]: ""
-  uo[5]: ""
-  uo[6]: ""
-  uo[7]: ""
+  uo[0]: "result[15] (MSB)"
+  uo[1]: "result[14]"
+  uo[2]: "result[13]"
+  uo[3]: "result[12]"
+  uo[4]: "result[11]"
+  uo[5]: "result[10]"
+  uo[6]: "result[9]"
+  uo[7]: "result[8]"
 
   # Bidirectional pins
-  uio[0]: ""
-  uio[1]: ""
-  uio[2]: ""
-  uio[3]: ""
-  uio[4]: ""
-  uio[5]: ""
-  uio[6]: ""
-  uio[7]: ""
+  uio[0]: "SPI SCK"
+  uio[1]: "SPI MOSI"
+  uio[2]: "SPI CS# (active low)"
+  uio[3]: "SPI MISO"
+  uio[4]: "BUSY"
+  uio[5]: "DONE"
+  uio[6]: "OVF"
+  uio[7]: "DBZ"
 
 # Do not change!
 yaml_version: 6
