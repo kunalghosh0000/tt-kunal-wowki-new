@@ -1,42 +1,169 @@
-![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
+# Tiny ML Coprocessor
 
-# Tiny Tapeout Verilog Project Template
+A fixed-point maths accelerator for the RP2040, implemented as a single Tiny Tapeout tile. It offloads multiply, divide, and neural-network dot-product operations from the RP2040 — freeing CPU cycles and doing division up to 5× faster than software floating-point.
 
-- [Read the documentation for project](docs/info.md)
+Designed primarily to accelerate **Kalman filter sensor fusion** and **small neural network inference**, but general enough to be used as a lightweight fixed-point coprocessor for any embedded ML workload.
 
-## What is Tiny Tapeout?
+## How it works
 
-Tiny Tapeout is an educational project that aims to make it easier and cheaper than ever to get your digital and analog designs manufactured on a real chip.
+The chip connects to the RP2040 over SPI. The RP2040 sends a command byte followed by data bytes, the chip performs the requested operation, and the result is read back. Operations that take multiple clock cycles (divide, dot product) assert a BUSY pin so the RP2040 can poll or busy-wait.
 
-To learn more and get started, visit https://tinytapeout.com.
+Internally the design has three parts:
 
-## Set up your Verilog project
+- **SPI slave** — receives and transmits bytes, synchronising the SPI clock into the chip's own clock domain
+- **Divider** — iterative 16-bit signed divider, takes 16 clock cycles, computes `reg_a / reg_b`
+- **Command brain** — state machine that decodes commands, holds operand registers, weight registers, and MAC accumulator, drives all operations
 
-1. Add your Verilog files to the `src` folder.
-2. Edit the [info.yaml](info.yaml) and update information about your project, paying special attention to the `source_files` and `top_module` properties. If you are upgrading an existing Tiny Tapeout project, check out our [online info.yaml migration tool](https://tinytapeout.github.io/tt-yaml-upgrade-tool/).
-3. Edit [docs/info.md](docs/info.md) and add a description of your project.
-4. Adapt the testbench to your design. See [test/README.md](test/README.md) for more information.
+All arithmetic uses **Q8.8 signed fixed-point** (16-bit two's complement). To encode a float: `(int16_t)(f * 256.0f)`. To decode: `(float)result / 256.0f`.
 
-The GitHub action will automatically build the ASIC files using [LibreLane](https://www.zerotoasiccourse.com/terminology/librelane/).
+### Kalman filter usage
 
-## Enable GitHub actions to build the results page
+The chip accelerates the three expensive operations in a scalar Kalman update step:
 
-- [Enabling GitHub Pages](https://tinytapeout.com/faq/#my-github-action-is-failing-on-the-pages-part)
+```
+Predict:   P⁻ = P + Q               (RP2040 does this — just one addition)
+Update:    K  = P⁻ / (P⁻ + R)       → load A=P⁻, B=(P⁻+R), issue DIV
+           x̂  = x̂ + K·(z − x̂)      → issue MUL, add result on RP2040
+           P  = (1 − K) · P⁻         → issue MUL
+```
+
+The RP2040 computes `P⁻ + R` in one integer instruction (the chip does not need a third register). The chip handles all three multiplications and the division.
+
+### Neural network dot product
+
+Eight 5-bit signed weights (Q1.4 format, range −1.0 to +0.9375) can be pre-loaded into the chip once. To run inference, stream 8 unsigned input bytes one at a time. The chip multiplies each input by the corresponding weight and accumulates the result. When all 8 have arrived, the Q8.8 dot product is available in the result register.
+
+## How to use
+
+### Wiring
+
+| RP2040 GPIO | Chip pin | Function |
+|---|---|---|
+| GP18 | uio[0] | SPI SCK |
+| GP19 | uio[1] | SPI MOSI |
+| GP17 | uio[2] | SPI CS# (active low) |
+| GP16 | uio[3] | SPI MISO |
+| GP20 | uio[4] | BUSY (high while operation running) |
+| GP21 | uio[5] | DONE (pulses high for 1 clock when result ready) |
+
+`uo_out[7:0]` always holds the high byte of the last result — useful for a quick sanity check without issuing a full read.
+
+### SPI settings
+
+- **Mode 0** (CPOL=0, CPHA=0)
+- **MSB first**
+- **8-bit frames**
+- **Max clock: 4 MHz** (limited by synchroniser latency; the chip runs at 50 MHz internally)
+
+### Command reference
+
+All commands are sent as an 8-bit command byte, followed by the data bytes shown.
+
+| Command | Hex | Data bytes | Description |
+|---|---|---|---|
+| LOAD_A | `0x10` | HI, LO | Load operand A (Q8.8, MSB first) |
+| LOAD_B | `0x11` | HI, LO | Load operand B (Q8.8, MSB first) |
+| LOAD_W | `0x13` | IDX, DAT | Load weight[IDX] = DAT[4:0] (Q1.4) |
+| MAC_START | `0x14` | — | Clear accumulator, prepare for 8 input bytes |
+| MAC_BYTE | `0x15` | DAT | Stream one input byte; repeat 8 times after MAC_START |
+| MUL | `0x20` | — | result = A × B (Q8.8, instant) |
+| DIV | `0x21` | — | result = A / B (Q8.8, 16 clock cycles) |
+| READ_HI | `0x30` | DUM | MISO returns result[15:8] (send one dummy byte) |
+| READ_LO | `0x31` | DUM | MISO returns result[7:0] (send one dummy byte) |
+| READ_STAT | `0x3F` | DUM | MISO returns `{ovf, dbz, busy, done, 4'b0}` |
+
+**Reading a result** requires two separate SPI transactions (CS must be deasserted between them):
+
+```
+CS low  → send 0x30 → send 0x00 → read MISO (high byte) → CS high
+CS low  → send 0x31 → send 0x00 → read MISO (low byte)  → CS high
+```
+
+**Running a dot product** (after weights are loaded):
+
+```
+CS low  → send 0x14 → CS high                          (start MAC)
+CS low  → send 0x15 → send input[0] → CS high          (byte 0)
+CS low  → send 0x15 → send input[1] → CS high          (byte 1)
+... repeat for inputs 2–7 ...
+wait until BUSY goes low
+read result with 0x30 / 0x31
+```
+
+### Fixed-point formats
+
+| Data | Format | Range | Step |
+|---|---|---|---|
+| Operands A, B, result | Q8.8 signed (16-bit) | −128.0 to +127.996 | ~0.004 |
+| MAC weights | Q1.4 signed (5-bit) | −1.0 to +0.9375 | 0.0625 |
+| MAC inputs | Unsigned 8-bit | 0 to 255 | 1 |
+
+Encode a float to Q8.8 in C: `(int16_t)(f * 256.0f)`  
+Encode a float to Q1.4 weight: `(int8_t)(f * 16.0f)`, clamped to ±15  
+Decode Q8.8 to float: `(float)raw / 256.0f`
+
+## External hardware
+
+No external components required. BUSY and DONE pins are optional — the RP2040 can also poll status via the READ_STAT command.
+
+## Design details
+
+### Fixed-point number representation
+
+All arithmetic is signed two's complement. Numbers are in Q8.8 format: the top 8 bits are the integer part and the bottom 8 bits are the fractional part — equivalent to multiplying the real value by 256 and storing as a 16-bit integer.
+
+**Example values:**
+
+| Real value | Q8.8 hex | Q8.8 decimal |
+|---|---|---|
+| 1.0 | `0x0100` | 256 |
+| 0.5 | `0x0080` | 128 |
+| −1.0 | `0xFF00` | −256 |
+| 0.25 | `0x0040` | 64 |
+
+### Divider
+
+Uses iterative binary long division (restoring method). Takes exactly 16 clock cycles regardless of the input values. Signed: converts both inputs to positive, divides, then applies the correct sign to the result. Divide-by-zero returns the maximum positive or negative value and asserts the DBZ status bit.
+
+The dividend is shifted left by 8 bits before division so that the result comes out in Q8.8 rather than as a plain integer quotient.
+
+### MAC (multiply-accumulate)
+
+Weights are Q1.4 signed (5-bit), inputs are unsigned 8-bit. Each multiply produces a Q1.12 signed product. Eight products are accumulated in a 20-bit register, which provides enough headroom for 8 × the maximum possible product without overflow. The final accumulator value is shifted right by 4 bits to produce the Q8.8 result.
+
+Weight precision of 5 bits (Q1.4) gives 32 distinct values between −1.0 and +0.9375, which is sufficient for inference with quantisation-aware trained models.
+
+### Gate count estimate
+
+| Block | Flip-flops |
+|---|---|
+| SPI slave | ~25 |
+| Divider | ~60 |
+| Operand registers (A, B, result) | 48 |
+| Weight file (8 × 5-bit) | 40 |
+| MAC accumulator + counter | 23 |
+| State machine + temporary regs | ~56 |
+| **Total** | **~252** |
+
+At approximately 6 gate-equivalents per flip-flop plus combinational logic, the design sits well within the single-tile budget (~4000 gate-equivalents).
+
+## IO
+
+| Pin | Direction | Description |
+|---|---|---|
+| ui_in[7:0] | input | Not used |
+| uo_out[7:0] | output | result[15:8] — high byte of last result |
+| uio[0] | input | SPI SCK |
+| uio[1] | input | SPI MOSI |
+| uio[2] | input | SPI CS# (active low) |
+| uio[3] | output | SPI MISO |
+| uio[4] | output | BUSY — high while divide or MAC is running |
+| uio[5] | output | DONE — pulses high for 1 clock when result is ready |
+| uio[6] | output | OVF — overflow flag (cleared on next command) |
+| uio[7] | output | DBZ — divide by zero flag |
 
 ## Resources
 
-- [FAQ](https://tinytapeout.com/faq/)
-- [Digital design lessons](https://tinytapeout.com/digital_design/)
-- [Learn how semiconductors work](https://tinytapeout.com/siliwiz/)
-- [Join the community](https://tinytapeout.com/discord)
-- [Build your design locally](https://www.tinytapeout.com/guides/local-hardening/)
-
-## What next?
-
-- [Submit your design to the next shuttle](https://app.tinytapeout.com/).
-- Edit [this README](README.md) and explain your design, how it works, and how to test it.
-- Share your project on your social network of choice:
-  - LinkedIn [#tinytapeout](https://www.linkedin.com/search/results/content/?keywords=%23tinytapeout) [@TinyTapeout](https://www.linkedin.com/company/100708654/)
-  - Mastodon [#tinytapeout](https://chaos.social/tags/tinytapeout) [@matthewvenn](https://chaos.social/@matthewvenn)
-  - X (formerly Twitter) [#tinytapeout](https://twitter.com/hashtag/tinytapeout) [@tinytapeout](https://twitter.com/tinytapeout)
-  - Bluesky [@tinytapeout.com](https://bsky.app/profile/tinytapeout.com)
+- [Tiny Tapeout documentation](https://tinytapeout.com)
+- [RP2040 datasheet](https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf)
+- [Pico SDK SPI API](https://www.raspberrypi.com/documentation/pico-sdk/)
